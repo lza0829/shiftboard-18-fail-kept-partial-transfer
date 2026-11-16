@@ -282,3 +282,165 @@ def test_concurrent_start_only_one_wins(client):
     assert codes.count(409) == 3, codes
     active = [h for h in client.get("/api/handovers").json() if h["status"] == "进行中"]
     assert len(active) == 1
+
+
+def _fail_mid_transfer(client, monkeypatch, on_call=2):
+    started_keys = _inflight(client, 1)
+    hid = _start(client)
+
+    real = svc._transfer_batch
+    calls = {"n": 0}
+
+    def flaky(conn, batch_id, from_id, to_id):
+        calls["n"] += 1
+        if calls["n"] == on_call:
+            raise svc.TransferError(f"模拟第 {on_call} 批过户写入失败")
+        return real(conn, batch_id, from_id, to_id)
+
+    monkeypatch.setattr(svc, "_transfer_batch", flaky)
+    body = client.post(f"/api/handovers/{hid}/complete").json()
+    assert body["status"] == "失败"
+    return hid, started_keys, body
+
+
+def test_failed_handover_persists_rollback_proof(client, monkeypatch):
+    """每次失败都落持久化回滚证明：归属指纹、失败后交班方在途、锁释放结果。"""
+    hid, started_keys, body = _fail_mid_transfer(client, monkeypatch)
+
+    proof = client.get(f"/api/handovers/{hid}/rollback-proof")
+    assert proof.status_code == 200, proof.text
+    p = proof.json()
+    assert p["有回滚证明"] is True
+    assert p["handover_status"] == "失败"
+    assert p["发起前归属指纹"].startswith("sha256:")
+    assert sorted(p["回滚后交班方在途批次"]) == started_keys
+    assert p["回滚后交班方在途与发起清单一致"] is True
+    assert p["锁释放结果"]["进行中锁"] == "已释放"
+    assert p["锁释放结果"]["双方可再次交班"] is True
+    assert p["回滚证明"]["回滚方式"].startswith("同一事务整单回滚")
+
+    # 详情接口与对账报告同源：指纹与在途集合一致
+    detail = client.get(f"/api/handovers/{hid}").json()
+    assert detail["rollback_proof"]["发起前归属指纹"] == p["发起前归属指纹"]
+    assert detail["report"]["detail"]["锁释放结果"] == p["锁释放结果"]
+    reports = {r["handover_id"]: r for r in client.get("/api/reconcile").json()}
+    assert reports[hid]["detail"] == p["回滚证明"]
+
+    # 证明里的指纹确实对应发起时快照，可由 handover_items 重算核对
+    with connect() as conn:
+        entries = [
+            {
+                "batch_id": r["batch_id"],
+                "biz_key": r["biz_key"],
+                "owner_shift_id": r["snapshot_owner_shift_id"],
+                "status": r["snapshot_status"],
+            }
+            for r in conn.execute(
+                """
+                SELECT hi.batch_id, b.biz_key, hi.snapshot_owner_shift_id, hi.snapshot_status
+                FROM handover_items hi JOIN batches b ON b.id = hi.batch_id
+                WHERE hi.handover_id = ?
+                """,
+                (hid,),
+            )
+        ]
+    assert svc._ownership_fingerprint(entries) == p["发起前归属指纹"]
+
+
+def test_rollback_proof_endpoint_readonly_and_missing(client, monkeypatch):
+    """只读接口：无失败单返回“无证明”，且不会改动任何数据；不存在单返回 404。"""
+    hid, _, _ = _fail_mid_transfer(client, monkeypatch)
+    before = client.get(f"/api/handovers/{hid}").json()
+    with connect() as conn:
+        batches_before = [
+            dict(r) for r in conn.execute("SELECT * FROM batches ORDER BY id")
+        ]
+
+    first = client.get(f"/api/handovers/{hid}/rollback-proof").json()
+    second = client.get(f"/api/handovers/{hid}/rollback-proof").json()
+    assert first == second
+
+    with connect() as conn:
+        batches_after = [
+            dict(r) for r in conn.execute("SELECT * FROM batches ORDER BY id")
+        ]
+    assert batches_after == batches_before
+    assert client.get(f"/api/handovers/{hid}").json() == before
+
+    ok_id = _start(client)
+    assert client.post(f"/api/handovers/{ok_id}/complete").json()["status"] == "已完成"
+    no_proof = client.get(f"/api/handovers/{ok_id}/rollback-proof").json()
+    assert no_proof["有回滚证明"] is False
+    assert no_proof["回滚证明"] is None
+
+    missing = client.get("/api/handovers/99999/rollback-proof")
+    assert missing.status_code == 404
+
+
+def test_failure_before_transfer_reports_no_write_rollback(client):
+    """过户前校验失败：归属未动，报告须写明“未发生归属变更，无需回滚”。"""
+    hid = _start(client)
+    with connect() as conn:
+        conn.execute("UPDATE batches SET status = '已结清' WHERE id = 3")
+        conn.commit()
+
+    assert client.post(f"/api/handovers/{hid}/complete").json()["status"] == "失败"
+    p = client.get(f"/api/handovers/{hid}/rollback-proof").json()
+    assert p["回滚证明"]["事务回滚已执行"] is False
+    assert p["回滚证明"]["回滚方式"].startswith("未发生归属变更")
+    assert p["锁释放结果"]["进行中锁"] == "已释放"
+    # 归属确实在原位
+    with connect() as conn:
+        bad = conn.execute(
+            "SELECT COUNT(*) AS c FROM batches WHERE owner_shift_id <> "
+            "(SELECT snapshot_owner_shift_id FROM handover_items "
+            " WHERE handover_id = ? AND batch_id = batches.id) "
+            "AND id IN (SELECT batch_id FROM handover_items WHERE handover_id = ?)",
+            (hid, hid),
+        ).fetchone()["c"]
+    assert bad == 0
+
+
+def test_failure_report_fallback_still_rolls_back_and_releases_lock(client, monkeypatch):
+    """完整失败报告写不进去时，兜底落档仍须零半截归属、释放锁，并给出最小证明。"""
+    started_keys = _inflight(client, 1)
+    hid = _start(client)
+
+    real_transfer = svc._transfer_batch
+    calls = {"n": 0}
+
+    def flaky(conn, batch_id, from_id, to_id):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise svc.TransferError("模拟第 2 批过户写入失败")
+        return real_transfer(conn, batch_id, from_id, to_id)
+
+    def boom(conn, h, reason, *, rolled_back):
+        raise RuntimeError("reconcile insert failed")
+
+    monkeypatch.setattr(svc, "_transfer_batch", flaky)
+    monkeypatch.setattr(svc, "_record_failure", boom)
+
+    resp = client.post(f"/api/handovers/{hid}/complete")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "失败"
+    assert "模拟第 2 批过户写入失败" in body["reason"]
+    # savepoint 撤销了第 1 批归属
+    assert _inflight(client, 1) == started_keys
+    assert _inflight(client, 2) == []
+
+    assert _shift_status(client, 1) == "值班中"
+    assert _shift_status(client, 2) == "空闲"
+    assert client.get("/api/dashboard").json()["进行中交班"] == 0
+
+    p = client.get(f"/api/handovers/{hid}/rollback-proof").json()
+    assert p["有回滚证明"] is True
+    assert "兜底" in p["回滚证明"]["落档说明"]
+    assert p["锁释放结果"]["双方可再次交班"] is True
+    assert sorted(p["回滚后交班方在途批次"]) == started_keys
+
+    retry = client.post("/api/handovers/start", json={"from_shift_id": 1, "to_shift_id": 2})
+    assert retry.status_code == 200, retry.text
+
+

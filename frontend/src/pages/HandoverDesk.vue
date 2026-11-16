@@ -158,6 +158,23 @@ function badgeClass(status) {
       <p v-if="lastResult.status === '失败'" class="msg">
         归属已回滚到发起前快照，双方班次恢复可再次交班，可重新发起。
       </p>
+      <div v-if="lastResult.status === '失败' && lastResult.report" class="proof">
+        <h3>回滚证明（与批次表、交班单同源）</h3>
+        <p class="proofline">
+          <span
+            class="tag"
+            :class="{ on: lastResult.report.detail['回滚后交班方在途与发起清单一致'], bad: !lastResult.report.detail['回滚后交班方在途与发起清单一致'] }"
+          >回滚后交班方在途与发起清单一致：{{ lastResult.report.detail['回滚后交班方在途与发起清单一致'] ? '是' : '否' }}</span>
+        </p>
+        <p>回滚后交班方在途批次：{{ (lastResult.report.detail.回滚后交班方在途批次 || []).join('、') || '—' }}
+          （{{ lastResult.report.detail.回滚后交班方在途批次数 ?? 0 }} 批）</p>
+        <p>发起前归属指纹：<code>{{ lastResult.report.detail.发起前归属指纹 || '—' }}</code> ·
+          回滚方式：{{ lastResult.report.detail.回滚方式 || '—' }}</p>
+        <p v-if="lastResult.report.detail.锁释放结果">
+          锁释放结果：{{ lastResult.report.detail.锁释放结果.进行中锁 }} ·
+          双方可再次交班：{{ lastResult.report.detail.锁释放结果.双方可再次交班 ? '是' : '否' }}
+        </p>
+      </div>
     </div>
   </div>
 </template>

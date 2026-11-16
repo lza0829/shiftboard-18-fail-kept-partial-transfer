@@ -220,3 +220,26 @@ select {
 .muted { color: var(--muted); font-size: 12px; }
 .detail { padding: 6px 4px 10px; color: var(--muted); font-size: 13px; }
 .detail p { margin: 4px 0; }
+.proof {
+  margin: 10px 0 6px;
+  padding: 10px 12px;
+  border: 1px dashed var(--danger);
+  background: rgba(196, 92, 92, 0.06);
+  font-size: 13px;
+  color: var(--ink);
+}
+.proof h3 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--danger);
+}
+.proof p { margin: 4px 0; }
+.proof .proofline { margin: 0 0 8px; }
+.proof code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--accent);
+  word-break: break-all;
+}
